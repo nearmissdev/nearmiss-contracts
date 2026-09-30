@@ -1,5 +1,6 @@
-//! Launchpad end to end in a local sandbox: store the collection code, create a
-//! collection, mint from it, check the fee split; then a failing create refunds.
+//! Launchpad end to end in a local sandbox: set the collection code hash, request
+//! and deploy a collection, mint from it, check the fee split; then wrong code is
+//! refused, a failing deploy refunds, and a creator can cancel a request.
 use near_workspaces::types::NearToken;
 use serde_json::json;
 
@@ -19,7 +20,11 @@ async fn create_mint_and_refund() -> anyhow::Result<()> {
     lp.call(lp.id(), "new").args_json(json!({"owner": admin.id(), "platform_treasury": platform.id(),
         "platform_fee_bps": 250, "base_uri": "https://nearmiss.fun/ipfs"})).transact().await?.into_result()?;
     let code = std::fs::read("../collection/target/near/nearmiss_collection.wasm")?;
-    admin.call(lp.id(), "set_code").args(code).max_gas().transact().await?.into_result()?;
+    admin.call(lp.id(), "set_code").args(code.clone()).max_gas().transact().await?.into_result()?;
+    let lp_state = lp.view_account().await?.storage_usage;
+    println!("launchpad storage after set_code: {lp_state} bytes");
+    assert!(lp_state < 250_000, "code bytes were stored");
+    let deploy = |slug: &str, code: Vec<u8>| admin.call(lp.id(), "deploy").args_borsh((slug.to_string(), code)).max_gas().transact();
 
     let cfg = json!({"name": "Night Shift", "symbol": "NIGHT", "total": 20, "price": near(0.5).as_yoctonear().to_string(),
         "max_per_tx": 5, "start_ms": null, "sequential": false, "media_ext": "png", "media_cid": "bafyimg",
@@ -39,6 +44,14 @@ async fn create_mint_and_refund() -> anyhow::Result<()> {
     let r = creator.call(lp.id(), "create_collection").args_json(json!({"slug": "night-shift", "config": cfg, "profile": profile, "open": true}))
         .deposit(need).max_gas().transact().await?;
     assert!(r.is_success(), "{:?}", r.failures());
+    assert!(!lpc.view("slug_available").args_json(json!({"slug": "night-shift"})).await?.json::<bool>()?, "reserved slug still free");
+    // wrong code is refused
+    let mut fake = code.clone();
+    fake[5000] ^= 1;
+    assert!(deploy("night-shift", fake).await?.is_failure(), "fake code accepted");
+    let r = deploy("night-shift", code.clone()).await?;
+    assert!(r.is_success(), "{:?}", r.failures());
+    assert!(deploy("night-shift", code.clone()).await?.is_failure(), "deployed twice");
     let col: serde_json::Value = lpc.view("get_collection").args_json(json!({"slug": "night-shift"})).await?.json()?;
     let cid = col["contract_id"].as_str().unwrap().to_string();
     println!("created {cid}; links {}", col["profile"]["links"]);
@@ -63,8 +76,9 @@ async fn create_mint_and_refund() -> anyhow::Result<()> {
         "max_per_tx": 5, "start_ms": null, "sequential": true, "media_ext": "png", "media_cid": "a", "refs_cid": "b", "royalty_bps": 900});
     sb.fast_forward(3).await?;
     let b0 = creator.view_account().await?.balance;
-    let r = creator.call(lp.id(), "create_collection").args_json(json!({"slug": "bad-one", "config": bad, "profile": profile, "open": true}))
-        .deposit(need).max_gas().transact().await?;
+    creator.call(lp.id(), "create_collection").args_json(json!({"slug": "bad-one", "config": bad, "profile": profile, "open": true}))
+        .deposit(need).max_gas().transact().await?.into_result()?;
+    let r = deploy("bad-one", code.clone()).await?;
     let created: bool = r.json().unwrap_or(false);
     assert!(!created);
     sb.fast_forward(5).await?;
@@ -75,6 +89,20 @@ async fn create_mint_and_refund() -> anyhow::Result<()> {
     assert!(gone.is_none());
     let avail: bool = lpc.view("slug_available").args_json(json!({"slug": "bad-one"})).await?.json()?;
     assert!(avail, "slug stuck in pending");
+
+    // a creator can cancel a request before deploy; a stranger cannot
+    sb.fast_forward(3).await?;
+    let b0 = creator.view_account().await?.balance;
+    creator.call(lp.id(), "create_collection").args_json(json!({"slug": "changed-mind", "config": cfg, "profile": profile, "open": true}))
+        .deposit(need).max_gas().transact().await?.into_result()?;
+    assert!(buyer.call(lp.id(), "cancel_request").args_json(json!({"slug": "changed-mind"})).max_gas().transact().await?.is_failure());
+    creator.call(lp.id(), "cancel_request").args_json(json!({"slug": "changed-mind"})).max_gas().transact().await?.into_result()?;
+    sb.fast_forward(3).await?;
+    let b1 = creator.view_account().await?.balance;
+    println!("cancelled request: creator lost {:.4} NEAR (gas only)", f(b0) - f(b1));
+    assert!(f(b0) - f(b1) < 0.05, "cancel did not refund");
+    assert!(deploy("changed-mind", code.clone()).await?.is_failure(), "deployed a cancelled request");
+    assert!(lpc.view("slug_available").args_json(json!({"slug": "changed-mind"})).await?.json::<bool>()?);
 
     // creator edits links; a stranger cannot
     let p2 = json!({"description": "New.", "cover": null, "links": {"x": null, "telegram": null, "discord": "https://discord.gg/abc", "website": null}});

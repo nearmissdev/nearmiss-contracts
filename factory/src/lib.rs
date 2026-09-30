@@ -1,10 +1,17 @@
 //! NEARMISS launchpad.
 //!
-//! Anyone can open a collection once the launchpad is open. `create_collection`
-//! creates `<slug>.<this account>`, deploys the collection contract stored here,
-//! and initialises it in one batch. If any step fails the creator gets the
-//! whole deposit back. The deposit pays the collection's own storage, which
-//! stays locked in the creator's collection account.
+//! Anyone can open a collection once the launchpad is open. Two steps:
+//!
+//! 1. `create_collection` (the creator) reserves `<slug>.<this account>` and
+//!    holds the deposit.
+//! 2. `deploy` (anyone; the NEARMISS service does it within seconds) passes the
+//!    collection wasm. The launchpad keeps only its SHA-256, so the bytes must
+//!    match exactly. It creates the account, deploys and initialises it in one
+//!    batch. If any step fails the creator gets the whole deposit back.
+//!
+//! Until step 2 runs, the creator can `cancel_request` for a full refund.
+//! The deposit pays the collection's own storage, which stays locked in the
+//! creator's collection account.
 //!
 //! The registry keeps what the site shows: name, supply, price, description
 //! and the creator's links (X, Telegram, Discord, website).
@@ -13,11 +20,12 @@ use near_sdk::json_types::U128;
 use near_sdk::serde_json::{self, json};
 use near_sdk::{env, near, require, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseError};
 
-const CODE_KEY: &[u8] = b"CODE";
+const CODE_HASH_KEY: &[u8] = b"CODE_HASH";
+const CODE_LEN_KEY: &[u8] = b"CODE_LEN";
 /// Headroom above the code size for the collection's initial state.
 const STATE_MARGIN: NearToken = NearToken::from_millinear(100);
 /// Kept by the launchpad to store the registry entry.
-const REGISTRY_FEE: NearToken = NearToken::from_millinear(20);
+const REGISTRY_FEE: NearToken = NearToken::from_millinear(30);
 const GAS_INIT: Gas = Gas::from_tgas(60);
 const GAS_CALLBACK: Gas = Gas::from_tgas(20);
 const MAX_PLATFORM_FEE_BPS: u16 = 250;
@@ -81,6 +89,16 @@ pub struct Collection {
     pub hidden: bool,
 }
 
+/// A reserved collection waiting for `deploy`.
+#[near(serializers = [json, borsh])]
+#[derive(Clone)]
+pub struct Request {
+    pub entry: Collection,
+    pub init: String,
+    pub deposit: U128,
+    pub in_flight: bool,
+}
+
 #[near(serializers = [json])]
 pub struct Info {
     pub owner: AccountId,
@@ -104,7 +122,7 @@ pub struct Launchpad {
     base_uri: String,
     collections: UnorderedMap<String, Collection>,
     by_creator: LookupMap<AccountId, Vec<String>>,
-    pending: LookupMap<String, AccountId>,
+    pending: UnorderedMap<String, Request>,
 }
 
 fn valid_slug(s: &str) -> bool {
@@ -146,7 +164,7 @@ impl Launchpad {
             base_uri,
             collections: UnorderedMap::new(Key::Collections),
             by_creator: LookupMap::new(Key::ByCreator),
-            pending: LookupMap::new(Key::Pending),
+            pending: UnorderedMap::new(Key::Pending),
         }
     }
 
@@ -155,7 +173,11 @@ impl Launchpad {
     }
 
     fn code_len(&self) -> u64 {
-        env::storage_read(CODE_KEY).map(|c| c.len() as u64).unwrap_or(0)
+        env::storage_read(CODE_LEN_KEY).map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0)
+    }
+
+    fn code_hash(&self) -> Vec<u8> {
+        env::storage_read(CODE_HASH_KEY).unwrap_or_default()
     }
 
     /// Deposit a creator attaches to `create_collection`.
@@ -167,19 +189,18 @@ impl Launchpad {
     // ------------------------------------------------------------------ create
 
     #[payable]
-    pub fn create_collection(&mut self, slug: String, config: CollectionConfig, profile: Profile, open: bool) -> Promise {
+    pub fn create_collection(&mut self, slug: String, config: CollectionConfig, profile: Profile, open: bool) {
         let creator = env::predecessor_account_id();
         require!(self.open || creator == self.owner, "The launchpad is not open yet");
         require!(valid_slug(&slug), "Name in the address: 2 to 32 characters, a-z, 0-9 and single dashes");
         require!(self.collections.get(&slug).is_none() && self.pending.get(&slug).is_none(), "That address is taken");
         check_profile(&profile);
-        let code = env::storage_read(CODE_KEY).unwrap_or_else(|| env::panic_str("Collection code not set"));
+        require!(self.code_len() > 0, "Collection code not set");
         let deposit = env::attached_deposit();
         let need = self.required_deposit().0;
         require!(deposit.as_yoctonear() >= need, format!("Attach at least {} yoctoNEAR", need));
 
         let contract_id: AccountId = format!("{}.{}", slug, env::current_account_id()).parse().unwrap();
-        self.pending.insert(&slug, &creator);
         let init = json!({
             "owner": creator,
             "treasury": creator,
@@ -191,7 +212,7 @@ impl Launchpad {
         });
         let entry = Collection {
             slug: slug.clone(),
-            contract_id: contract_id.clone(),
+            contract_id,
             creator: creator.clone(),
             name: config.name.clone(),
             symbol: config.symbol.clone(),
@@ -202,12 +223,36 @@ impl Launchpad {
             profile,
             hidden: false,
         };
-        Promise::new(contract_id)
+        self.pending.insert(&slug, &Request { entry, init: init.to_string(), deposit: U128(deposit.as_yoctonear()), in_flight: false });
+        env::log_str(&format!("EVENT_JSON:{}", json!({"standard": "nearmiss_launchpad", "version": "1.0.0",
+            "event": "collection_requested", "data": [{"slug": slug, "creator": creator}]})));
+    }
+
+    /// Step 2: deploy a reserved collection. Anyone may call it; the wasm must
+    /// hash to the stored code hash. Arguments are Borsh: (slug, wasm bytes).
+    pub fn deploy(&mut self, #[serializer(borsh)] slug: String, #[serializer(borsh)] code: Vec<u8>) -> Promise {
+        let mut req = self.pending.get(&slug).unwrap_or_else(|| env::panic_str("No request for that address"));
+        require!(!req.in_flight, "Already deploying");
+        require!(env::sha256(&code) == self.code_hash(), "Code does not match the launchpad's collection code");
+        require!(env::prepaid_gas().as_tgas() >= 150, "Attach at least 150 TGas");
+        req.in_flight = true;
+        self.pending.insert(&slug, &req);
+        let deposit = NearToken::from_yoctonear(req.deposit.0);
+        Promise::new(req.entry.contract_id.clone())
             .create_account()
             .transfer(deposit.saturating_sub(REGISTRY_FEE))
             .deploy_contract(code)
-            .function_call("new".to_string(), init.to_string().into_bytes(), NearToken::from_yoctonear(0), GAS_INIT)
-            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CALLBACK).on_created(entry, U128(deposit.as_yoctonear())))
+            .function_call("new".to_string(), req.init.into_bytes(), NearToken::from_yoctonear(0), GAS_INIT)
+            .then(Self::ext(env::current_account_id()).with_static_gas(GAS_CALLBACK).on_created(req.entry, req.deposit))
+    }
+
+    /// Before `deploy` runs, the creator can take the request back with a full refund.
+    pub fn cancel_request(&mut self, slug: String) -> Promise {
+        let req = self.pending.get(&slug).unwrap_or_else(|| env::panic_str("No request for that address"));
+        require!(env::predecessor_account_id() == req.entry.creator, "Creator only");
+        require!(!req.in_flight, "Already deploying");
+        self.pending.remove(&slug);
+        Promise::new(req.entry.creator).transfer(NearToken::from_yoctonear(req.deposit.0))
     }
 
     #[private]
@@ -240,15 +285,14 @@ impl Launchpad {
     // ------------------------------------------------------------------ views
 
     pub fn info(&self) -> Info {
-        let code = env::storage_read(CODE_KEY).unwrap_or_default();
         Info {
             owner: self.owner.clone(),
             platform_treasury: self.platform_treasury.clone(),
             platform_fee_bps: self.platform_fee_bps,
             open: self.open,
             base_uri: self.base_uri.clone(),
-            code_size: code.len() as u64,
-            code_hash: near_sdk::bs58::encode(env::sha256(&code)).into_string(),
+            code_size: self.code_len(),
+            code_hash: near_sdk::bs58::encode(self.code_hash()).into_string(),
             required_deposit: self.required_deposit(),
             collections: self.collections.len(),
         }
@@ -273,18 +317,29 @@ impl Launchpad {
         self.by_creator.get(&creator).unwrap_or_default().iter().filter_map(|s| self.collections.get(s)).collect()
     }
 
+    /// Reserved collections waiting for `deploy`.
+    pub fn list_pending(&self, from_index: Option<u64>, limit: Option<u64>) -> Vec<Request> {
+        self.pending.values().skip(from_index.unwrap_or(0) as usize).take(limit.unwrap_or(50).min(200) as usize).collect()
+    }
+
+    pub fn get_pending(&self, slug: String) -> Option<Request> {
+        self.pending.get(&slug)
+    }
+
     pub fn slug_available(&self, slug: String) -> bool {
         valid_slug(&slug) && self.collections.get(&slug).is_none() && self.pending.get(&slug).is_none()
     }
 
     // ------------------------------------------------------------------ owner
 
-    /// Store the collection wasm. Call with the raw wasm bytes as the argument.
+    /// Set the collection code. Call with the raw wasm bytes as the argument;
+    /// only its SHA-256 and length are stored.
     pub fn set_code(&mut self) {
         self.assert_owner();
         let code = env::input().unwrap_or_else(|| env::panic_str("Pass the wasm bytes"));
         require!(code.len() > 1000 && &code[..4] == b"\0asm", "Not a wasm file");
-        env::storage_write(CODE_KEY, &code);
+        env::storage_write(CODE_HASH_KEY, &env::sha256(&code));
+        env::storage_write(CODE_LEN_KEY, &(code.len() as u64).to_le_bytes());
     }
 
     pub fn set_open(&mut self, open: bool) {
