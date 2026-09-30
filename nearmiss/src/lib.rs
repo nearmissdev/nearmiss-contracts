@@ -9,7 +9,7 @@
 //! enumeration, NEP-199 payouts, NEP-297 events.
 use std::collections::HashMap;
 
-use near_contract_standards::non_fungible_token::approval::NonFungibleTokenApproval;
+use near_contract_standards::non_fungible_token::approval::{ext_nft_approval_receiver, NonFungibleTokenApproval};
 use near_contract_standards::non_fungible_token::core::{NonFungibleTokenCore, NonFungibleTokenResolver};
 use near_contract_standards::non_fungible_token::enumeration::NonFungibleTokenEnumeration;
 use near_contract_standards::non_fungible_token::events::NftMint;
@@ -20,12 +20,14 @@ use near_contract_standards::non_fungible_token::{NonFungibleToken, Token, Token
 use near_sdk::collections::{LazyOption, LookupMap};
 use near_sdk::json_types::U128;
 use near_sdk::{
-    assert_one_yocto, env, near, require, AccountId, BorshStorageKey, NearToken, PanicOnDefault, Promise,
+    assert_one_yocto, env, near, require, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise,
     PromiseOrValue,
 };
 
 pub const TOTAL: u32 = 3333;
 pub const MAX_PER_TX: u8 = 5;
+/// Minimum for the approved account's nft_on_approve; it also gets all unused gas.
+const GAS_FOR_ON_APPROVE: Gas = Gas::from_tgas(15);
 const MAX_ROYALTY_BPS: u16 = 1000; // 10%
 
 #[derive(BorshStorageKey)]
@@ -388,7 +390,20 @@ impl NonFungibleTokenResolver for Contract {
 impl NonFungibleTokenApproval for Contract {
     #[payable]
     fn nft_approve(&mut self, token_id: TokenId, account_id: AccountId, msg: Option<String>) -> Option<Promise> {
-        self.tokens.nft_approve(token_id, account_id, msg)
+        // The standard call does the bookkeeping and refunds any excess deposit. Its own
+        // nft_on_approve call reserves only a fixed 10 TGas margin, which a refund to an
+        // implicit account (it may create the account) uses up. So the callback is made
+        // here, with a minimum and all remaining gas, sized by the runtime.
+        self.tokens.nft_approve(token_id.clone(), account_id.clone(), None);
+        let msg = msg?;
+        let owner_id = self.tokens.owner_by_id.get(&token_id).unwrap();
+        let approval_id = self.tokens.approvals_by_id.as_ref().and_then(|a| a.get(&token_id)).and_then(|m| m.get(&account_id).copied()).unwrap();
+        Some(
+            ext_nft_approval_receiver::ext(account_id)
+                .with_static_gas(GAS_FOR_ON_APPROVE)
+                .with_unused_gas_weight(1)
+                .nft_on_approve(token_id, owner_id, approval_id, msg),
+        )
     }
 
     #[payable]
