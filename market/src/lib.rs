@@ -66,6 +66,21 @@ pub struct Payout {
     pub payout: HashMap<AccountId, U128>,
 }
 
+/// Sales through this market for one collection. Kept under its own storage key,
+/// outside the contract struct, so adding it needed no state migration.
+#[near(serializers = [json, borsh])]
+#[derive(Clone, Default)]
+pub struct Stats {
+    pub volume: U128,
+    pub sales: u64,
+    pub last_price: U128,
+    pub last_sale_ms: u64,
+}
+
+fn stats_key(nft: &AccountId) -> Vec<u8> {
+    format!("STATS:{}", nft).into_bytes()
+}
+
 #[near(serializers = [json])]
 pub struct Info {
     pub owner: AccountId,
@@ -315,6 +330,12 @@ impl Market {
                 if extra_refund.0 > 0 {
                     Promise::new(buyer.clone()).transfer(NearToken::from_yoctonear(extra_refund.0)).detach();
                 }
+                let mut st = self.stats(nft_contract_id.clone());
+                st.volume = U128(st.volume.0 + price);
+                st.sales += 1;
+                st.last_price = U128(price);
+                st.last_sale_ms = env::block_timestamp_ms();
+                env::storage_write(&stats_key(&nft_contract_id), &near_sdk::borsh::to_vec(&st).unwrap());
                 emit("sale", json!({"nft_contract_id": nft_contract_id, "token_id": token_id, "seller_id": seller,
                     "buyer_id": buyer, "price": U128(price), "fee": U128(fee)}));
                 true
@@ -446,6 +467,22 @@ impl Market {
     pub fn get_offers(&self, nft_contract_id: AccountId, token_id: String) -> Vec<Offer> {
         let Some(set) = self.offers_by_token.get(&key(&nft_contract_id, &token_id)) else { return vec![] };
         set.iter().filter_map(|b| self.offers.get(&offer_key(&nft_contract_id, &token_id, &b))).collect()
+    }
+
+    pub fn stats(&self, nft_contract_id: AccountId) -> Stats {
+        env::storage_read(&stats_key(&nft_contract_id))
+            .map(|b| near_sdk::borsh::from_slice(&b).unwrap())
+            .unwrap_or_default()
+    }
+
+    /// Every open offer in a collection, oldest first.
+    pub fn get_collection_offers(&self, nft_contract_id: AccountId, from_index: Option<u64>, limit: Option<u64>) -> Vec<Offer> {
+        self.offers
+            .values()
+            .filter(|o| o.nft_contract_id == nft_contract_id)
+            .skip(from_index.unwrap_or(0) as usize)
+            .take(limit.unwrap_or(100).min(500) as usize)
+            .collect()
     }
 
     // ------------------------------------------------------------ owner

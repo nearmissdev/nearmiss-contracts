@@ -68,17 +68,28 @@ async fn list_buy_offer_accept() -> anyhow::Result<()> {
     assert!((f(nt1) - f(nt0) - 0.04875).abs() < 1e-4, "royalty 5% of net");
     assert!((f(s1) - f(s0) - 0.92625).abs() < 0.005, "seller proceeds");
     assert!(f(b0) - f(b1) < 1.01, "overpayment refunded");
+    let st: serde_json::Value = market.view("stats").args_json(json!({"nft_contract_id": nft.id()})).await?.json()?;
+    assert_eq!(st["sales"], 1);
+    assert_eq!(st["volume"], near(1.0).as_yoctonear().to_string());
 
     // offer 0.5 from bidder, accepted by the new holder
     bidder.call(market.id(), "make_offer").args_json(json!({"nft_contract_id": nft.id(), "token_id": token}))
         .deposit(near(0.51)).transact().await?.into_result()?;
     let offers: Vec<serde_json::Value> = market.view("get_offers").args_json(json!({"nft_contract_id": nft.id(), "token_id": token})).await?.json()?;
     assert_eq!(offers.len(), 1);
+    let all: Vec<serde_json::Value> = market.view("get_collection_offers").args_json(json!({"nft_contract_id": nft.id()})).await?.json()?;
+    assert_eq!(all.len(), 1, "collection offers");
     let res = buyer.call(nft.id(), "nft_approve").args_json(json!({"token_id": token, "account_id": market.id(),
         "msg": json!({"accept_offer": bidder.id()}).to_string()})).deposit(near(0.01)).max_gas().transact().await?;
     assert!(res.is_success(), "{:?}", res.failures());
     let owner: serde_json::Value = nft.view("nft_token").args_json(json!({"token_id": token})).await?.json()?;
     assert_eq!(owner["owner_id"], bidder.id().to_string());
+    let st: serde_json::Value = market.view("stats").args_json(json!({"nft_contract_id": nft.id()})).await?.json()?;
+    assert_eq!(st["sales"], 2, "accepted offer counted");
+    let vol: u128 = st["volume"].as_str().unwrap().parse()?;
+    assert!((vol as f64 / 1e24 - 1.5).abs() < 1e-9, "volume {vol}");
+    let all: Vec<serde_json::Value> = market.view("get_collection_offers").args_json(json!({"nft_contract_id": nft.id()})).await?.json()?;
+    assert!(all.is_empty(), "accepted offer still listed");
 
     // withdraw path: a second offer is refunded in full
     let t2: String = seller.call(nft.id(), "nft_mint_random").args_json(json!({"count": 1}))
@@ -107,5 +118,7 @@ async fn list_buy_offer_accept() -> anyhow::Result<()> {
     let x1 = buyer.view_account().await?.balance;
     println!("stale buy: logs {:?}; buyer lost {:.4}", res.logs().iter().filter(|l| l.contains("sale")).collect::<Vec<_>>(), f(x0) - f(x1));
     assert!(f(x0) - f(x1) < 0.01, "stale buy kept the money");
+    let st: serde_json::Value = market.view("stats").args_json(json!({"nft_contract_id": nft.id()})).await?.json()?;
+    assert_eq!(st["sales"], 2, "failed sale counted");
     Ok(())
 }
